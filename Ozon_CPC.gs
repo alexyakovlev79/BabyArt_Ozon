@@ -37,6 +37,9 @@ const BAOZ_CPC_SOFT_STOP_MS = 30000;    // стоп за 30 секунд до л
 const BAOZ_CPC_CAMPAIGNS_PAGE_SIZE = 100;
 const BAOZ_CPC_PRODUCTS_PAGE_SIZE = 1000;
 const BAOZ_CPC_MAX_PRODUCTS_PAGES_GUARD = 300; // предохранитель от вечных циклов
+const BAOZ_CPC_STATS_PAGE_SIZE = 1000;
+const BAOZ_CPC_DEBUG_PROP = 'BAOZ_CPC_DEBUG';
+const BAOZ_CPC_DEBUG_RAW_LIMIT = 4000;
 
 // Батч записи в лист (чтобы не держать гигантский массив в памяти)
 const BAOZ_CPC_WRITE_BATCH = 2000;
@@ -102,8 +105,9 @@ function BAOZ_CPC_Sync() {
     for (let i = cursor.intervalIdx; i < intervals.length; i++) {
       const it = intervals[i];
       const spendMap = BAOZ_CPC_getCpcExpenseMap_(token, it.from, it.to); // null если не смогли получить
-      const statsMap = BAOZ_CPC_getCpcCampaignStatsMap_(token, it.from, it.to);
-
+      const productStatsMap = BAOZ_CPC_getCpcProductStatsMap_(token, it.from, it.to);
+      const debugMode = BAOZ_CPC_isDebug_();
+      let debugCampaignLogged = false;
 
       const cStart = (i === cursor.intervalIdx) ? cursor.campaignIdx : 0;
       for (let c = cStart; c < campaigns.length; c++) {
@@ -119,7 +123,13 @@ function BAOZ_CPC_Sync() {
           }
         }
 
-        const st = (statsMap && statsMap[String(camp.id)]) ? statsMap[String(camp.id)] : null;
+        const campStats = productStatsMap[String(camp.id)] || {};
+        Logger.log('CPC: campaign_id=%s period=%s..%s product_stats=%s', String(camp.id), BAOZ_CPC_fmtYmd_(it.from), BAOZ_CPC_fmtYmd_(it.to), String(Object.keys(campStats).length));
+
+        if (debugMode && !debugCampaignLogged) {
+          BAOZ_CPC_debugCampaignProductStats_(token, camp.id, it.from, it.to);
+          debugCampaignLogged = true;
+        }
 
         // Если totalExpense === null (не смогли разобрать ответ/параметры) — НЕ фильтруем, идём дальше как раньше.
 
@@ -152,8 +162,9 @@ function BAOZ_CPC_Sync() {
 
           for (const p of products) {
             const skuKey = BAOZ_CPC_normSkuKey_(p.sku);
+            const st = campStats[skuKey] || null;
 
-                        const row = new Array(BAOZ_CPC_HEADERS.length).fill('');
+            const row = new Array(BAOZ_CPC_HEADERS.length).fill('');
             row[0] = it.from;
             row[1] = it.to;
             row[2] = String(camp.id || '');
@@ -162,7 +173,7 @@ function BAOZ_CPC_Sync() {
             row[5] = sku2art[skuKey] || '';   // Артикул
             row[6] = String(p.title || '');
 
-            // статистика (JSON /statistics/campaign/product/json) — на уровне кампании
+            // статистика (JSON /statistics/campaign/product/json) — на уровне товара
             if (st) {
               row[8]  = (st.views === 0 || st.views) ? st.views : '';
               row[9]  = (st.clicks === 0 || st.clicks) ? st.clicks : '';
@@ -448,54 +459,94 @@ function BAOZ_CPC_getCpcExpenseMap_(token, fromDate, toDate) {
 
     return map;
   } catch (e) {
+    Logger.log('CPC API error expense/json period=%s..%s: %s', ymdFrom, ymdTo, String(e && e.message || e));
     // если расход не получили — фильтрацию НЕ применяем (чтобы ничего не потерять)
     return null;
   }
 }
-function BAOZ_CPC_getCpcCampaignStatsMap_(token, dateFrom, dateTo) {
+function BAOZ_CPC_getCpcProductStatsMap_(token, dateFrom, dateTo) {
   const from = BAOZ_CPC_fmtYmd_(dateFrom);
   const to = BAOZ_CPC_fmtYmd_(dateTo);
 
-  const path =
-    '/api/client/statistics/campaign/product/json' +
-    '?dateFrom=' + encodeURIComponent(from) +
-    '&dateTo=' + encodeURIComponent(to);
-
-  const obj = BAOZ_CPC_httpJson_('get', path, null, token);
-  const rows = BAOZ_CPC_extractCampaignStatsRows_(obj);
-
   const out = {};
-  for (const r of rows) {
-    const id = String((r && r.id) || '').trim();
-    if (!id) continue;
+  let page = 1;
+  let debugRawLogged = false;
 
-    out[id] = {
-      id: id,
-      title: (r && r.title) ? String(r.title) : '',
-      objectType: (r && r.objectType) ? String(r.objectType) : '',
-      status: (r && r.status) ? String(r.status) : '',
-      placement: (r && r.placement) ? String(r.placement) : '',
-      weeklyBudget: BAOZ_CPC_toNumber_(r && r.weeklyBudget),
-      budget: BAOZ_CPC_toNumber_(r && r.budget),
-      moneySpent: BAOZ_CPC_toNumber_(r && r.moneySpent),
-      views: BAOZ_CPC_toNumber_(r && r.views),
-      clicks: BAOZ_CPC_toNumber_(r && r.clicks),
-      ctr: BAOZ_CPC_toNumber_(r && r.ctr),
-      clickPrice: BAOZ_CPC_toNumber_(r && r.clickPrice),
-      orders: BAOZ_CPC_toNumber_(r && r.orders),
-      ordersMoney: BAOZ_CPC_toNumber_(r && r.ordersMoney),
-      drr: BAOZ_CPC_toNumber_(r && r.drr),
-      toCart: BAOZ_CPC_toNumber_(r && r.toCart),
-      strategy: (r && r.strategy) ? String(r.strategy) : ''
-    };
+  while (page <= BAOZ_CPC_MAX_PRODUCTS_PAGES_GUARD) {
+    const path =
+      '/api/client/statistics/campaign/product/json' +
+      '?dateFrom=' + encodeURIComponent(from) +
+      '&dateTo=' + encodeURIComponent(to) +
+      '&page=' + page +
+      '&pageSize=' + BAOZ_CPC_STATS_PAGE_SIZE;
+
+    let meta;
+    try {
+      meta = BAOZ_CPC_httpJsonWithMeta_('get', path, null, token);
+    } catch (e) {
+      Logger.log('CPC API error campaign/product/json page=%s period=%s..%s: %s', String(page), from, to, String(e && e.message || e));
+      throw e;
+    }
+
+    if (!debugRawLogged && BAOZ_CPC_isDebug_()) {
+      const raw = String(meta && meta.text || '');
+      const rawSnippet = raw.slice(0, BAOZ_CPC_DEBUG_RAW_LIMIT);
+      const keys = Object.keys((meta && meta.obj && typeof meta.obj === 'object') ? meta.obj : {}).join(',');
+      Logger.log('CPC DEBUG global product stats request: path=%s', path);
+      Logger.log('CPC DEBUG global product stats top-level keys: %s', keys || '(none)');
+      Logger.log('CPC DEBUG global product stats raw(0..%s): %s', String(BAOZ_CPC_DEBUG_RAW_LIMIT), rawSnippet);
+      debugRawLogged = true;
+    }
+
+    const obj = meta && meta.obj;
+    const rows = BAOZ_CPC_extractCampaignStatsRows_(obj);
+    if (!rows.length) break;
+
+    const items = BAOZ_CPC_collectCampaignProductStats_(rows);
+    for (const it of items) {
+      const campaignId = BAOZ_CPC_normSkuKey_(it.campaignId);
+      const skuKey = BAOZ_CPC_normSkuKey_(it.sku);
+      if (!campaignId || !skuKey) continue;
+
+      if (!out[campaignId]) out[campaignId] = {};
+      out[campaignId][skuKey] = {
+        views: BAOZ_CPC_toNumber_(it.views),
+        clicks: BAOZ_CPC_toNumber_(it.clicks),
+        ctr: BAOZ_CPC_toNumber_(it.ctr),
+        toCart: BAOZ_CPC_toNumber_(it.toCart),
+        clickPrice: BAOZ_CPC_toNumber_(it.clickPrice),
+        moneySpent: BAOZ_CPC_toNumber_(it.moneySpent),
+        orders: BAOZ_CPC_toNumber_(it.orders),
+        ordersMoney: BAOZ_CPC_toNumber_(it.ordersMoney),
+        drr: BAOZ_CPC_toNumber_(it.drr)
+      };
+    }
+
+    if (!BAOZ_CPC_hasNextPage_(obj, rows.length, page, BAOZ_CPC_STATS_PAGE_SIZE)) break;
+    page += 1;
   }
 
   return out;
 }
 
 function BAOZ_CPC_extractCampaignStatsRows_(obj) {
-  if (!obj || typeof obj !== 'object') return [];
-  return Array.isArray(obj.rows) ? obj.rows : [];
+  if (!obj) return [];
+  if (Array.isArray(obj)) return obj;
+  if (typeof obj !== 'object') return [];
+
+  const candidates = [
+    obj.rows,
+    obj.items,
+    obj.result && obj.result.rows,
+    obj.result && obj.result.items,
+    obj.data && obj.data.rows,
+    obj.data && obj.data.items,
+    obj.statistics,
+    obj.stats
+  ];
+  for (const v of candidates) if (Array.isArray(v)) return v;
+
+  return [];
 }
 
 
@@ -504,6 +555,145 @@ function BAOZ_CPC_extractExpenseRows_(obj) {
   return Array.isArray(obj.rows) ? obj.rows : [];
 }
 
+
+
+function BAOZ_CPC_collectCampaignProductStats_(rows) {
+  const out = [];
+  for (const row of rows) {
+    BAOZ_CPC_walkCampaignStatsNode_(row, '', 0, out);
+  }
+  return out;
+}
+
+function BAOZ_CPC_walkCampaignStatsNode_(node, inheritedCampaignId, depth, out) {
+  if (!node || depth > 7) return;
+
+  if (Array.isArray(node)) {
+    for (const item of node) BAOZ_CPC_walkCampaignStatsNode_(item, inheritedCampaignId, depth + 1, out);
+    return;
+  }
+
+  if (typeof node !== 'object') return;
+
+  const campaignId = BAOZ_CPC_detectCampaignId_(node, inheritedCampaignId);
+
+  if (BAOZ_CPC_isProductStatsNode_(node)) {
+    const sku = node.sku ?? node.offerId ?? node.offer_id ?? node.skuId ?? node.sku_id;
+    out.push({
+      campaignId: campaignId,
+      sku: sku,
+      views: node.views ?? node.impressions,
+      clicks: node.clicks,
+      ctr: node.ctr,
+      toCart: node.toCart ?? node.addToCart,
+      clickPrice: node.clickPrice ?? node.avgBid ?? node.avgCpc,
+      moneySpent: node.moneySpent ?? node.spend ?? node.expense,
+      orders: node.orders,
+      ordersMoney: node.ordersMoney ?? node.revenue ?? node.sales,
+      drr: node.drr
+    });
+  }
+
+  for (const key of Object.keys(node)) {
+    const v = node[key];
+    if (v && typeof v === 'object') {
+      BAOZ_CPC_walkCampaignStatsNode_(v, campaignId, depth + 1, out);
+    }
+  }
+}
+
+function BAOZ_CPC_detectCampaignId_(node, inheritedCampaignId) {
+  if (!node || typeof node !== 'object') return inheritedCampaignId || '';
+
+  const direct =
+    node.campaignId ?? node.campaign_id ?? node.advCampaignId ?? node.adv_campaign_id ??
+    (node.campaign && (node.campaign.id ?? node.campaign.campaignId ?? node.campaign.campaign_id));
+  if (direct !== null && direct !== undefined && String(direct).trim() !== '') return String(direct).trim();
+
+  const maybeCampaignId = node.id;
+  const hasCampaignChildren =
+    Array.isArray(node.products) || Array.isArray(node.items) || Array.isArray(node.offers) ||
+    Array.isArray(node.statistics) || Array.isArray(node.stats) || Array.isArray(node.skus);
+  if (hasCampaignChildren && maybeCampaignId !== null && maybeCampaignId !== undefined && String(maybeCampaignId).trim() !== '') {
+    return String(maybeCampaignId).trim();
+  }
+
+  return inheritedCampaignId || '';
+}
+
+function BAOZ_CPC_isProductStatsNode_(node) {
+  if (!node || typeof node !== 'object') return false;
+  const hasSku = node.sku !== undefined || node.offerId !== undefined || node.offer_id !== undefined || node.skuId !== undefined || node.sku_id !== undefined;
+  if (!hasSku) return false;
+
+  return (
+    node.views !== undefined || node.impressions !== undefined ||
+    node.clicks !== undefined || node.ctr !== undefined ||
+    node.moneySpent !== undefined || node.spend !== undefined || node.expense !== undefined ||
+    node.orders !== undefined || node.ordersMoney !== undefined || node.revenue !== undefined || node.sales !== undefined
+  );
+}
+
+function BAOZ_CPC_isDebug_() {
+  const props = PropertiesService.getScriptProperties().getProperties();
+  const v = String(props[BAOZ_CPC_DEBUG_PROP] || '').trim().toLowerCase();
+  return v === '1' || v === 'true' || v === 'yes' || v === 'on';
+}
+
+function BAOZ_CPC_debugCampaignProductStats_(token, campaignId, fromDate, toDate) {
+  const from = BAOZ_CPC_fmtYmd_(fromDate);
+  const to = BAOZ_CPC_fmtYmd_(toDate);
+  const payload = {
+    campaign_id: String(campaignId || ''),
+    dateFrom: from,
+    dateTo: to,
+    page: 1,
+    pageSize: Math.min(100, BAOZ_CPC_STATS_PAGE_SIZE)
+  };
+
+  const path =
+    '/api/client/statistics/campaign/product/json' +
+    '?dateFrom=' + encodeURIComponent(from) +
+    '&dateTo=' + encodeURIComponent(to) +
+    '&campaignId=' + encodeURIComponent(String(campaignId || '')) +
+    '&page=1&pageSize=' + Math.min(100, BAOZ_CPC_STATS_PAGE_SIZE);
+
+  try {
+    const meta = BAOZ_CPC_httpJsonWithMeta_('get', path, null, token);
+    const keys = Object.keys((meta && meta.obj && typeof meta.obj === 'object') ? meta.obj : {}).join(',');
+    const raw = String(meta && meta.text || '').slice(0, BAOZ_CPC_DEBUG_RAW_LIMIT);
+    Logger.log('CPC DEBUG single-campaign payload: %s', JSON.stringify(payload));
+    Logger.log('CPC DEBUG single-campaign request path: %s', path);
+    Logger.log('CPC DEBUG single-campaign response keys: %s', keys || '(none)');
+    Logger.log('CPC DEBUG single-campaign raw(0..%s): %s', String(BAOZ_CPC_DEBUG_RAW_LIMIT), raw);
+  } catch (e) {
+    Logger.log('CPC DEBUG single-campaign request failed campaign_id=%s period=%s..%s: %s', String(campaignId || ''), from, to, String(e && e.message || e));
+  }
+}
+
+function BAOZ_CPC_hasNextPage_(obj, rowsLen, page, pageSize) {
+  if (obj && typeof obj === 'object') {
+    if (obj.has_next === true || obj.hasNext === true) return true;
+    if (obj.pagination && (obj.pagination.has_next === true || obj.pagination.hasNext === true)) return true;
+
+    const nextPage = obj.next_page ?? obj.nextPage ?? (obj.pagination && (obj.pagination.next_page ?? obj.pagination.nextPage));
+    if (nextPage !== null && nextPage !== undefined && String(nextPage) !== '') {
+      const n = Number(nextPage);
+      if (!isNaN(n)) return n > page;
+      return true;
+    }
+
+    const offset = obj.offset ?? (obj.pagination && obj.pagination.offset);
+    const total = obj.total ?? obj.total_count ?? (obj.pagination && (obj.pagination.total ?? obj.pagination.total_count));
+    if (offset !== null && offset !== undefined && total !== null && total !== undefined) {
+      const o = Number(offset);
+      const t = Number(total);
+      if (!isNaN(o) && !isNaN(t)) return o + rowsLen < t;
+    }
+  }
+
+  return rowsLen >= pageSize;
+}
 
 function BAOZ_CPC_fmtYmd_(d) {
   const tz = Session.getScriptTimeZone() || 'GMT';
@@ -525,7 +715,7 @@ function BAOZ_CPC_toNumber_(v) {
   return isNaN(n) ? null : n;
 }
 
-function BAOZ_CPC_httpJson_(method, path, payload, bearer) {
+function BAOZ_CPC_httpJsonWithMeta_(method, path, payload, bearer) {
   const url = BAOZ_CPC_PERF_HOST + path;
 
   const opt = {
@@ -548,6 +738,13 @@ function BAOZ_CPC_httpJson_(method, path, payload, bearer) {
     throw new Error(`HTTP ${code} ${path}: ${text}`);
   }
 
-  try { return JSON.parse(text); }
-  catch (_) { return { _raw: text }; }
+  let obj;
+  try { obj = JSON.parse(text); }
+  catch (_) { obj = { _raw: text }; }
+
+  return { code: code, text: text, obj: obj };
+}
+
+function BAOZ_CPC_httpJson_(method, path, payload, bearer) {
+  return BAOZ_CPC_httpJsonWithMeta_(method, path, payload, bearer).obj;
 }
